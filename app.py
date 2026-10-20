@@ -5,8 +5,10 @@ sys.path.insert(0, str(Path(__file__).parent))
 import html
 import hashlib
 import json
+import re
 import pandas as pd
 import streamlit as st
+from PIL import Image, ImageDraw
 from src.cache_parser import parse_cache, CacheParseError
 from src.catalog import load_catalog_bytes, match_records, normalize_fetched_catalog, apply_manual_matches, score_signature
 from src.catalog_sources import fetch_waterfish, fetch_lxns, fetch_saltmeta, CatalogFetchError
@@ -102,7 +104,15 @@ div[data-testid="stPopover"] > button:hover { border-color:#cbb7ed; color:#49376
 .song-meta { color:#9286a8;font-size:.68rem;line-height:1.55; }
 .dx-score-row { display:flex;align-items:center;justify-content:space-between;gap:4px;white-space:nowrap; }
 .dx-stars { font-size:.86rem;font-weight:950;letter-spacing:.015em;white-space:nowrap;text-shadow:0 0 5px #ffffffb3; }
-.song-rating { color:#9b56d7;font-size:1rem;font-weight:950;margin-top:auto;border-top:1px solid #eee5fb;padding-top:5px; }
+.song-achievement { font-size:1rem;font-weight:950;line-height:1.2;letter-spacing:.005em;margin:0 0 1px;white-space:nowrap; }
+.song-achievement.achievement-blue { color:#347dca; }
+.song-achievement.achievement-red { color:#d94b5b; }
+.song-achievement.achievement-gold { color:#ad8410; }
+.song-card-content { flex:1;display:flex;flex-direction:column;min-width:0; }
+.song-rating { display:flex;align-items:center;justify-content:space-between;gap:5px;color:#9b56d7;font-size:1rem;font-weight:950;margin-top:auto;border-top:1px solid #eee5fb;padding-top:5px; }
+.song-clear-status { flex:0 0 auto;margin-left:auto;font-size:.78rem;font-weight:1000;line-height:1.1;letter-spacing:.015em;white-space:nowrap; }
+.song-clear-status.clear-fc { color:#249755; }
+.song-clear-status.clear-ap { color:#e27b19; }
 .tag { display:inline-block;padding:2px 5px;margin-right:3px;font-size:.61rem;background:#f0e9ff;color:#8663c1;border-radius:5px;font-weight:800; }
 hr { border-color:#ffffffb5; }
 [data-testid="stDataFrame"] { background:#fff9; border-radius:12px; }
@@ -141,9 +151,18 @@ with nav2:
         st.markdown("<div class='step-hint'>选择与成绩存档匹配的曲库地区；同步后会缓存谱面元数据。</div>", unsafe_allow_html=True)
 with nav3:
     with st.container(key="step-rating"):
-        mode_label = st.selectbox("③ Rating 规则", ["直接取 Best 50（不区分版本）", "标准 B35 + B15"], index=0, help="默认直接从所有合格谱面中取前 50 首；也可以切换为旧版本 B35 + 所选版本 B15。")
-        st.markdown("<div class='step-hint'>默认使用全局 Best 50；也可切换为标准模式，拆分旧版本 B35 与指定版本 B15。</div>", unsafe_allow_html=True)
-mode = "split" if mode_label.startswith("标准") else "direct"
+        mode_label = st.selectbox(
+            "③ Rating 规则",
+            ["直接取 Best 50（不区分版本）", "标准 B35 + B15", "仿真 B35 + B15"],
+            index=0,
+            help=(
+                "标准模式：B35 从所有非目标版本中选取，B15 取指定版本；"
+                "仿真模式：B35 只从目标版本之前的版本中选取，B15 只取目标版本，"
+                "目标版本之后的成绩完全排除。"
+            ),
+        )
+        st.markdown("<div class='step-hint'>标准模式按指定版本拆分；仿真模式进一步排除目标版本及其之后版本对 B35 的影响。</div>", unsafe_allow_html=True)
+mode = "simulation" if mode_label.startswith("仿真") else ("split" if mode_label.startswith("标准") else "direct")
 
 refresh_col, catalog_upload_col = st.columns([1.15, 4.5], gap="large")
 with refresh_col:
@@ -231,11 +250,164 @@ else:
 if not catalog:
     st.error("没有读取到有效谱面数据。"); st.stop()
 
+def _compact_version_label(value: object) -> str:
+    """Compact a version label for tolerant matching across catalogue providers."""
+    import unicodedata
+    value = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    return re.sub(r"[^\w]", "", value, flags=re.UNICODE)
+
+
+def _version_rank(value: object, version_source: str) -> int | None:
+    """Return chronological rank for a known JP/INTL or CN maimai DX version.
+
+    CN labels use their own DX20xx progression and are never interleaved with
+    Japanese/International names. Unknown labels return None so simulation mode
+    can fail closed rather than accidentally pulling a future version into B35.
+    """
+    label = _compact_version_label(value)
+    if not label:
+        return None
+
+    # These labels identify the CN catalogue even if the user uploaded its CSV
+    # instead of selecting SaltMeta's explicit CN source.
+    if label == "舞萌dx":
+        return 0
+    if label == "舞萌":
+        return -1
+
+    is_cn_catalogue = version_source == "SaltMeta · 国服 CN"
+    # CN catalogue labels commonly use DX2021, DX2022, ...; accept these labels
+    # from imported catalogues too, while keeping the region's sequence separate.
+    year_match = re.search(r"(20\d{2})", label)
+    if is_cn_catalogue or (year_match and ("dx" in label or "舞萌" in label)):
+        if year_match:
+            return int(year_match.group(1)) - 2020
+        if "舞萌dx" in label or label in {"dx", "maimaidx", "deluxe"}:
+            return 0
+        if label in {"舞萌", "maimai"}:
+            return -1
+        return None
+
+    # Old maimai generation, then the DX generation. The order is intentionally
+    # explicit: sorting version names alphabetically would be incorrect.
+    ordered_labels = [
+        (0, ("maimai", "初代")),
+        (1, ("maimaiplus",)),
+        (2, ("green",)),
+        (3, ("greenplus",)),
+        (4, ("orange",)),
+        (5, ("orangeplus",)),
+        (6, ("pink",)),
+        (7, ("pinkplus",)),
+        (8, ("murasaki",)),
+        (9, ("murasakiplus",)),
+        (10, ("milk",)),
+        (11, ("milkplus",)),
+        (12, ("finale",)),
+        (13, ("dx", "deluxe", "でらっくす")),
+        (14, ("dxplus", "deluxeplus", "でらっくすplus")),
+        (15, ("splash", "すぷらっしゅ")),
+        (16, ("splashplus", "すぷらっしゅplus")),
+        (17, ("universe",)),
+        (18, ("universeplus",)),
+        (19, ("festival",)),
+        (20, ("festivalplus",)),
+        (21, ("buddies",)),
+        (22, ("buddiesplus",)),
+        (23, ("prism",)),
+        (24, ("prismplus",)),
+        (25, ("circle",)),
+        (26, ("circleplus",)),
+        (27, ("magical",)),
+    ]
+
+    # Match newer named generations before generic DX / maimai aliases.
+    # This also handles provider labels such as "maimai DX FESTiVAL PLUS".
+    for rank, aliases in reversed(ordered_labels[15:]):
+        if any(alias in label for alias in aliases):
+            return rank
+    if "dxplus" in label or "deluxeplus" in label or "でらっくすplus" in label:
+        return 14
+    if "splash" in label or "すぷらっしゅ" in label:
+        return 16 if "plus" in label else 15
+    if "dx" in label or "deluxe" in label or "でらっくす" in label:
+        return 14 if "plus" in label else 13
+
+    for rank, aliases in reversed(ordered_labels[:13]):
+        if any(alias in label for alias in aliases):
+            # Avoid treating a plain "maimai DX" label as the original generation.
+            if rank == 0 and any(token in label for token in ("dx", "deluxe", "でらっくす")):
+                return 13
+            if rank == 1 and "dx" in label:
+                return 14
+            return rank
+    if label in {"舞萌", "舞萌dx"}:
+        return 0 if label == "舞萌dx" else -1
+    return None
+
+
+def _sort_versions_chronologically(version_labels: list[str], version_source: str) -> list[str]:
+    original_positions = {label: index for index, label in enumerate(version_labels)}
+    def key(label: str):
+        rank = _version_rank(label, version_source)
+        if rank is None:
+            return (1, label.casefold(), original_positions[label])
+        return (0, rank, original_positions[label])
+    return sorted(version_labels, key=key)
+
+
+def _select_simulation_b35_b15(records: list[dict], target_version: str, version_source: str):
+    """Select B35 only before target version, and B15 only from target version."""
+    target_rank = _version_rank(target_version, version_source)
+    if target_rank is None:
+        return [], [], 0, "无法识别所选版本「{}」的发行顺序；为避免把较新版本错误计入 B35，仿真模式已停止计算。请使用支持版本标签的曲库。".format(target_version)
+
+    eligible = [row for row in records if not is_utage_record(row)]
+    older_pool, target_pool = [], []
+    unknown_count = 0
+    for row in eligible:
+        rank = _version_rank(row.get("version", ""), version_source)
+        if rank is None:
+            unknown_count += 1
+        elif rank < target_rank:
+            older_pool.append(row)
+        elif rank == target_rank:
+            target_pool.append(row)
+        # Versions after the selected target are deliberately ignored.
+
+    sort_key = lambda row: (row.get("rating", 0), row.get("achievement", 0), row.get("dx_score", 0))
+    return (
+        sorted(older_pool, key=sort_key, reverse=True)[:35],
+        sorted(target_pool, key=sort_key, reverse=True)[:15],
+        unknown_count,
+        None,
+    )
+
+
 versions = list(dict.fromkeys(str(r.get("version") or "未知版本").strip() for r in catalog if r.get("version")))
-if mode == "split":
-    default_version = versions[-1] if versions else "未知版本"
-    target_version = st.selectbox("B15 所属版本", versions, index=versions.index(default_version) if default_version in versions else 0,
-        help="选择 B15 所属的最新版本。SaltMeta 的日服数据使用日服版本标签；国服使用地区化 CN 版本数据。")
+# Infer CN ordering for imported/alternate-source catalogues whose labels look like DX2021, DX2022, etc.
+version_order_source = source
+if source != "SaltMeta · 国服 CN" and any(
+    re.search(r"20\d{2}", _compact_version_label(version))
+    and ("dx" in _compact_version_label(version) or "舞萌" in _compact_version_label(version))
+    for version in versions
+):
+    version_order_source = "SaltMeta · 国服 CN"
+versions = _sort_versions_chronologically(versions, version_order_source)
+if mode in ("split", "simulation"):
+    recognized_versions = [version for version in versions if _version_rank(version, version_order_source) is not None]
+    default_version = (recognized_versions[-1] if recognized_versions else (versions[-1] if versions else "未知版本"))
+    version_help = (
+        "仿真模式：B15 只取所选版本，B35 只允许取发行顺序早于所选版本的成绩；"
+        "更晚版本不会进入 B35。国服 DX20xx 使用独立的国服顺序。"
+        if mode == "simulation"
+        else "标准模式：B15 取所选版本，B35 从所有非该版本的成绩中选取。"
+    )
+    target_version = st.selectbox(
+        "B15 所属版本", versions,
+        index=versions.index(default_version) if default_version in versions else 0,
+        help=version_help,
+    )
 else:
     target_version = None
 
@@ -259,8 +431,15 @@ if True:
 matched, unmatched = match_records(score_rows, catalog)
 if manual_choices:
     matched, unmatched = apply_manual_matches(matched, unmatched, manual_choices)
+simulation_unknown_versions = 0
+simulation_error = None
 if mode == "split":
     old, new = select_b50(matched, mode="split", target_version=target_version)
+    total_rating = sum(x["rating"] for x in old) + sum(x["rating"] for x in new)
+elif mode == "simulation":
+    old, new, simulation_unknown_versions, simulation_error = _select_simulation_b35_b15(
+        matched, target_version, version_order_source
+    )
     total_rating = sum(x["rating"] for x in old) + sum(x["rating"] for x in new)
 else:
     top50, _ = select_b50(matched, mode="direct")
@@ -268,6 +447,28 @@ else:
     total_rating = sum(x["rating"] for x in top50)
 
 # Dashboard-style summary cards.
+def _b50_preview_canvas(source: str | Path | None, width: int = 320, height: int = 160) -> Image.Image:
+    """Render any B50 asset into a same-sized preview canvas without distortion."""
+    canvas = Image.new("RGBA", (width, height), (250, 248, 255, 255))
+    if source is not None:
+        source_path = Path(source)
+        if source_path.is_file():
+            try:
+                with Image.open(source_path) as opened:
+                    image = opened.convert("RGBA")
+                    image.thumbnail((width - 16, height - 16), Image.Resampling.LANCZOS)
+                x = (width - image.width) // 2
+                y = (height - image.height) // 2
+                canvas.alpha_composite(image, (x, y))
+                return canvas
+            except (OSError, ValueError):
+                pass
+
+    draw = ImageDraw.Draw(canvas)
+    draw.text((width // 2, height // 2), "预览不可用", fill=(135, 123, 159, 255), anchor="mm")
+    return canvas
+
+
 def metric_card(label, value, tier=None, tooltip=""):
     css_class = "metric-card" + (" rating-" + tier[0] if tier else "")
     title_attr = " title='{}'".format(html.escape(str(tooltip), quote=True)) if tooltip else ""
@@ -287,12 +488,27 @@ with m3: metric_card("UNMATCHED", "{:,}".format(len(unmatched)), tooltip="未匹
 with m4:
     metric_card("CACHE / CHARTS", str(cache_obj.get("version", "?")), tooltip="{} 条有成绩 / {} 条谱面。".format(len(played), len(score_rows)))
 
-if mode == "split":
+if mode in ("split", "simulation"):
+    if simulation_error:
+        st.error(simulation_error)
+    elif mode == "simulation":
+        st.info(
+            "仿真规则：B15 只计算「{}」；B35 只从它之前的版本选取。"
+            "「{}」以及之后的版本不会进入 B35。".format(target_version, target_version)
+        )
     r1, r2 = st.columns(2, gap="large")
     b35_rating = sum(x["rating"] for x in old)
     b15_rating = sum(x["rating"] for x in new)
-    with r1: metric_card("B35 · OLD CHARTS", "{:,}".format(b35_rating), rating_tier_for_slots(b35_rating, 35), "{} / 35 个槽位；颜色门槛按 35/50 比例折算。".format(len(old)))
+    b35_label = "B35 · BEFORE TARGET" if mode == "simulation" else "B35 · OLD CHARTS"
+    b35_help = (
+        "只使用发行顺序早于 {} 的版本；之后版本以及版本标签无法识别的记录均不计入。".format(target_version)
+        if mode == "simulation"
+        else "标准模式下所有非目标版本均可参与 B35。"
+    )
+    with r1: metric_card(b35_label, "{:,}".format(b35_rating), rating_tier_for_slots(b35_rating, 35), "{} / 35 个槽位；{} 颜色门槛按 35/50 比例折算。".format(len(old), b35_help))
     with r2: metric_card("B15 · SELECTED VERSION", "{:,}".format(b15_rating), rating_tier_for_slots(b15_rating, 15), "{} / 15 个槽位 · {}；颜色门槛按 15/50 比例折算。".format(len(new), target_version))
+    if mode == "simulation" and simulation_unknown_versions:
+        st.warning("仿真模式已排除 {:,} 条版本标签无法识别的成绩，以避免误把未来版本计入 B35。".format(simulation_unknown_versions))
     if len(old) < 35 or len(new) < 15:
         st.warning("B35 / B15 槽位未填满。请检查成绩数量、版本选择或未匹配曲目。")
 elif len(old) < 50:
@@ -343,21 +559,52 @@ def render_cards(title, records, key):
                 rank_color = achievement_rank_color(ach)
                 rank_markup = "<span class='song-rank rank-{}'>{}</span>".format(rank_color, html.escape(rank_label))
                 title_row = "<div class='song-title-row'><div class='song-title'>{}</div>{}</div>".format(title_text, rank_markup)
-                st.markdown("<div class='song-card'>{}<div style='flex:1;min-width:0'>{}<span class='tag'>{}</span><span class='tag'>{}</span><span class='tag'>{}</span><div class='song-meta'>版本：{}<br>达成率：{:.4f}%<br>{}</div><div class='song-rating'>RATING　{}</div></div></div>".format(cover_html, title_row, diff, chart_type or "MAIMAI DX", constant, version, ach, dx_line, rating), unsafe_allow_html=True)
+
+                # Achievement is deliberately prominent and sits above the chart tags.
+                ach_color = "blue" if ach < 80.0 else ("red" if ach < 97.0 else "gold")
+                achievement_markup = "<div class='song-achievement achievement-{}'>达成率　{:.4f}%</div>".format(ach_color, ach)
+
+                # AstroDX cache clearType: 3=FC, 4=FC+, 5=AP, 6=AP+.
+                try:
+                    clear_type = int(rec.get("clear_type") or 0)
+                except (TypeError, ValueError):
+                    clear_type = 0
+                clear_statuses = {
+                    3: ("FC", "clear-fc"),
+                    4: ("FC+", "clear-fc"),
+                    5: ("AP", "clear-ap"),
+                    6: ("AP+", "clear-ap"),
+                }
+                clear_status = clear_statuses.get(clear_type)
+                clear_markup = (
+                    "<span class='song-clear-status {}'>{}</span>".format(clear_status[1], clear_status[0])
+                    if clear_status else ""
+                )
+                st.markdown(
+                    "<div class='song-card'>{}<div class='song-card-content'>{}{}<div class='song-tags'>"
+                    "<span class='tag'>{}</span><span class='tag'>{}</span><span class='tag'>{}</span>"
+                    "</div><div class='song-meta'>版本：{}</div>{}<div class='song-rating'><span>RATING　{}</span>{}</div></div></div>".format(
+                        cover_html, title_row, achievement_markup,
+                        diff, chart_type or "MAIMAI DX", constant,
+                        version, dx_line, rating, clear_markup,
+                    ),
+                    unsafe_allow_html=True,
+                )
     df = pd.DataFrame(records)
     cols = [c for c in ["title", "difficulty", "constant", "achievement", "rating", "dx_score", "version", "song_type", "song_id"] if c in df.columns]
     st.download_button("导出 {} CSV".format(title), df[cols].to_csv(index=False).encode("utf-8-sig"), file_name=key + ".csv", mime="text/csv")
 
-if mode == "split":
-    render_cards("B35 · OLD", old, "b35_old")
+if mode in ("split", "simulation"):
+    b35_card_title = ("B35 · BEFORE " + target_version) if mode == "simulation" else "B35 · OLD"
+    render_cards(b35_card_title, old, "b35_simulation" if mode == "simulation" else "b35_old")
     render_cards("B15 · " + target_version, new, "b15_selected")
 else:
     render_cards("BEST 50 · ALL VERSIONS", old, "best50")
 
 # B50 poster: use the public Shio796 renderer, adapted to consume these local records.
-all_selected = (old + new) if mode == "split" else old
+all_selected = (old + new) if mode in ("split", "simulation") else old
 png_signature = hashlib.sha256(json.dumps({
-    "scores": [{k: r.get(k) for k in ("title", "difficulty", "constant", "achievement", "rating", "dx_score", "version", "song_id", "cover_id", "song_type", "notes", "total_notes")} for r in all_selected],
+    "scores": [{k: r.get(k) for k in ("title", "difficulty", "constant", "achievement", "rating", "dx_score", "clear_type", "version", "song_id", "cover_id", "song_type", "notes", "total_notes")} for r in all_selected],
     "rating": total_rating, "mode": mode_label, "source": source,
     "static_dir": str(Path(__file__).resolve().parent / "static"),
     "display_name": st.session_state.get("b50_display_name_input", "AstroDX Player"),
@@ -374,6 +621,10 @@ with st.container(border=True):
     st.markdown("使用公开 B50 模板绘图；将本页匹配好的本地成绩直接转换为绘图数据，不调用水鱼账号查分流程。")
     static_path = str(Path(__file__).resolve().parent / "static")
     static_valid, static_result = validate_static_dir(static_path)
+    if static_valid:
+        st.success("绘图素材校验通过。")
+    else:
+        st.error("绘图素材校验失败：{}".format(static_result))
     display_name = st.text_input(
         "图片上显示的昵称", value=st.session_state.get("b50_display_name", "AstroDX Player"),
         max_chars=24, key="b50_display_name_input",
@@ -408,6 +659,16 @@ with st.container(border=True):
 
     icon_name_by_id = {int(item["id"]): str(item["name"]) for item in icon_items}
     plate_name_by_id = {int(item["id"]): str(item["name"]) for item in plate_items}
+
+    # Pin friendly labels for the requested default assets when they exist in the
+    # cached catalogue. Their IDs are the stable identifiers used for selection.
+    preferred_icon_id = 458022
+    preferred_plate_id = 559501
+    if preferred_icon_id in icon_name_by_id:
+        icon_name_by_id[preferred_icon_id] = "♡百合咲 ミカ♡"
+    if preferred_plate_id in plate_name_by_id:
+        plate_name_by_id[preferred_plate_id] = "Divide et impera!（ソルト）"
+
     icon_options = [None] + sorted(icon_name_by_id)
     plate_options = [None] + sorted(plate_name_by_id)
     # Preserve a previously selected ID when a refresh temporarily fails and the
@@ -420,6 +681,22 @@ with st.container(border=True):
     if previous_plate is not None and previous_plate not in plate_options:
         plate_options.append(previous_plate)
         plate_name_by_id.setdefault(previous_plate, "已保存的姓名框")
+
+    # Set each preferred selection once a usable catalogue is available. If no
+    # catalogue exists, None remains selected and the renderer uses local assets.
+    # The per-kind flags ensure reruns do not overwrite a later manual selection.
+    if icon_items and not st.session_state.get("_b50_icon_default_initialized", False):
+        if st.session_state.get("b50_online_icon_id") is None:
+            st.session_state["b50_online_icon_id"] = (
+                preferred_icon_id if preferred_icon_id in icon_name_by_id else None
+            )
+        st.session_state["_b50_icon_default_initialized"] = True
+    if plate_items and not st.session_state.get("_b50_plate_default_initialized", False):
+        if st.session_state.get("b50_online_plate_id") is None:
+            st.session_state["b50_online_plate_id"] = (
+                preferred_plate_id if preferred_plate_id in plate_name_by_id else None
+            )
+        st.session_state["_b50_plate_default_initialized"] = True
 
     pic_dir = Path(static_result) / "mai" / "pic" if static_valid else None
     match_files = local_level_options(static_result, "UI_DNM_DaniPlate_") if static_valid else []
@@ -445,11 +722,6 @@ with st.container(border=True):
             key="b50_match_level_file",
             format_func=lambda value: "段位 {}　·　{}".format(Path(value).stem.rsplit("_", 1)[-1], value),
         )
-        if pic_dir is not None:
-            match_preview_path = pic_dir / selected_match_file
-            if match_preview_path.is_file():
-                st.markdown("**段位预览**")
-                st.image(str(match_preview_path), width=100)
     with option_col2:
         selected_plate_id = st.selectbox(
             "姓名框", plate_options,
@@ -463,11 +735,6 @@ with st.container(border=True):
             key="b50_class_level_file",
             format_func=lambda value: "阶级 {}　·　{}".format(Path(value).stem.rsplit("_", 1)[-1], value),
         )
-        if pic_dir is not None:
-            class_preview_path = pic_dir / selected_class_file
-            if class_preview_path.is_file():
-                st.markdown("**友人对战阶级预览**")
-                st.image(str(class_preview_path), width=100)
 
     if icon_catalog_error:
         st.caption("在线头像目录暂不可用，仍可使用默认头像。详情：{}".format(icon_catalog_error))
@@ -477,42 +744,84 @@ with st.container(border=True):
     icon_asset_path = None
     plate_asset_path = None
     asset_selection_ready = True
-    preview_col1, preview_col2 = st.columns(2)
-    with preview_col1:
-        try:
-            if selected_icon_id is None:
-                if pic_dir is not None:
-                    default_icon = pic_dir.parent / "icon" / "UI_Icon_000001.png"
-                    if default_icon.is_file():
-                        st.image(str(default_icon), caption="当前头像：默认", width=96)
-            else:
-                icon_asset_path = ensure_lxns_asset_image(
-                    "icon", selected_icon_id, network_mode=network_mode, proxy_url=proxy_url
-                )
-                st.image(icon_asset_path, caption="当前头像：{}".format(icon_name_by_id.get(selected_icon_id, selected_icon_id)), width=96)
-        except Exception as exc:
-            asset_selection_ready = False
-            st.warning("头像预览加载失败：{}".format(exc))
-    with preview_col2:
-        try:
-            if selected_plate_id is None:
-                if pic_dir is not None:
-                    default_plate = pic_dir.parent / "plate" / "UI_Plate_000001.png"
-                    if default_plate.is_file():
-                        st.image(str(default_plate), caption="当前姓名框：默认", width=180)
-            else:
-                plate_asset_path = ensure_lxns_asset_image(
-                    "plate", selected_plate_id, network_mode=network_mode, proxy_url=proxy_url
-                )
-                st.image(plate_asset_path, caption="当前姓名框：{}".format(plate_name_by_id.get(selected_plate_id, selected_plate_id)), width=180)
-        except Exception as exc:
-            asset_selection_ready = False
-            st.warning("姓名框预览加载失败：{}".format(exc))
+
+    # Resolve the selected online assets for the renderer, while keeping
+    # separate local paths for previews when the default assets are selected.
+    icon_preview_path = None
+    plate_preview_path = None
+    if pic_dir is not None:
+        default_icon = pic_dir.parent / "icon" / "UI_Icon_000001.png"
+        default_plate = pic_dir.parent / "plate" / "UI_Plate_000001.png"
+        if default_icon.is_file():
+            icon_preview_path = default_icon
+        if default_plate.is_file():
+            plate_preview_path = default_plate
+
+    try:
+        if selected_icon_id is not None:
+            icon_asset_path = ensure_lxns_asset_image(
+                "icon", selected_icon_id, network_mode=network_mode, proxy_url=proxy_url
+            )
+            icon_preview_path = icon_asset_path
+    except Exception as exc:
+        asset_selection_ready = False
+        st.warning("头像预览加载失败：{}".format(exc))
+
+    try:
+        if selected_plate_id is not None:
+            plate_asset_path = ensure_lxns_asset_image(
+                "plate", selected_plate_id, network_mode=network_mode, proxy_url=proxy_url
+            )
+            plate_preview_path = plate_asset_path
+    except Exception as exc:
+        asset_selection_ready = False
+        st.warning("姓名框预览加载失败：{}".format(exc))
+
+    match_preview_path = (Path(pic_dir) / selected_match_file) if pic_dir is not None else None
+    class_preview_path = (Path(pic_dir) / selected_class_file) if pic_dir is not None else None
+
+    # All four previews use the same 2:1 canvas and equal-width columns.
+    # Order: icon, nameplate, rating plate, friend-match class.
+    preview_specs = [
+        ("头像", icon_preview_path, "当前头像：默认" if selected_icon_id is None else "当前头像：{}".format(icon_name_by_id.get(selected_icon_id, selected_icon_id))),
+        ("姓名框", plate_preview_path, "当前姓名框：默认" if selected_plate_id is None else "当前姓名框：{}".format(plate_name_by_id.get(selected_plate_id, selected_plate_id))),
+        ("段位", match_preview_path, "段位 {}".format(Path(selected_match_file).stem.rsplit("_", 1)[-1])),
+        ("友人对战阶级", class_preview_path, "阶级 {}".format(Path(selected_class_file).stem.rsplit("_", 1)[-1])),
+    ]
+    preview_cols = st.columns(4, gap="small")
+    for preview_col, (preview_title, preview_path, preview_detail) in zip(preview_cols, preview_specs):
+        with preview_col:
+            st.markdown(
+                "<div style='text-align:center;font-weight:800;color:#594573;margin:0 0 6px'>{}</div>".format(html.escape(preview_title)),
+                unsafe_allow_html=True,
+            )
+            st.image(_b50_preview_canvas(preview_path), use_container_width=True)
+            st.markdown(
+                "<div style='text-align:center;color:#827795;font-size:.76rem;line-height:1.35;overflow-wrap:anywhere;margin-top:4px'>{}</div>".format(html.escape(preview_detail)),
+                unsafe_allow_html=True,
+            )
+
     if st.button("生成 B50 图片（开源模板）", key="generate_upstream_b50_png", use_container_width=True, disabled=(not all_selected or not static_valid or not asset_selection_ready)):
         try:
             with st.spinner("正在按上游 B50 模板生成图片…"):
-                rating_summary = ("B35: {} + B15: {} = {}".format(sum(x.get("rating", 0) for x in old), sum(x.get("rating", 0) for x in new), total_rating)
-                                  if mode == "split" else "BEST 50 RATING: {}".format(total_rating))
+                rating_summary = (
+                    "B35 (before {}): {} + B15: {} = {}".format(
+                        target_version,
+                        sum(x.get("rating", 0) for x in old),
+                        sum(x.get("rating", 0) for x in new),
+                        total_rating,
+                    )
+                    if mode == "simulation"
+                    else (
+                        "B35: {} + B15: {} = {}".format(
+                            sum(x.get("rating", 0) for x in old),
+                            sum(x.get("rating", 0) for x in new),
+                            total_rating,
+                        )
+                        if mode == "split"
+                        else "BEST 50 RATING: {}".format(total_rating)
+                    )
+                )
                 png_bytes = generate_upstream_b50_png(
                     old, new, total_rating, display_name, static_result,
                     network_mode=network_mode, proxy_url=proxy_url,

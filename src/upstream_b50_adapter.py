@@ -299,6 +299,24 @@ def _song_type(record: dict[str, Any]) -> str:
     return "DX"
 
 
+def _clear_type_to_fc(record: dict[str, Any]) -> str:
+    """Translate AstroDX cache clearType into the renderer/API FC badge codes.
+
+    AstroDX cache uses 2=clear, 3=FC, 4=FC+, 5=AP, 6=AP+.
+    Only FC/AP achievements are surfaced by the score cards and B50 poster.
+    """
+    try:
+        clear_type = int(record.get("clear_type") or 0)
+    except (TypeError, ValueError):
+        return ""
+    return {
+        3: "fc",
+        4: "fcp",
+        5: "ap",
+        6: "app",
+    }.get(clear_type, "")
+
+
 def _record_to_chart_info(record: dict[str, Any], song_id: int) -> SimpleNamespace:
     try:
         achievement = float(record.get("achievement") or 0)
@@ -313,7 +331,8 @@ def _record_to_chart_info(record: dict[str, Any], song_id: int) -> SimpleNamespa
         achievements=achievement,
         ds=constant,
         dxScore=score,
-        fc="",
+        # The public renderer consumes API-style values: fc / fcp / ap / app.
+        fc=_clear_type_to_fc(record),
         fs="",
         level=str(record.get("level_text") or record.get("level") or record.get("difficulty") or ""),
         level_index=_difficulty_index(record),
