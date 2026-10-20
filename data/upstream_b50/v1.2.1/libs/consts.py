@@ -26,7 +26,7 @@ config_json: Path = static / 'config.json'
 music_file: Path = static / 'music_data.json'
 
 # 静态资源路径
-maimaidir: Path = static / 'mai' / 'pic'
+maimaidir: Path = Path(os.environ.get('ASTRODX_B50_PIC', static / 'mai' / 'pic'))
 coverdir: Path = static / 'mai' / 'cover'
 customdir: Path = root / 'custom'
 icondir: Path = static / 'mai' / 'icon'

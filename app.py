@@ -603,9 +603,26 @@ else:
 
 # B50 poster: use the public Shio796 renderer, adapted to consume these local records.
 all_selected = (old + new) if mode in ("split", "simulation") else old
+
+# B50 主题映射：主题素材覆盖原版同名文件，缺失素材回退到原版。
+B50_THEMES = {
+    "原版": None,
+    "CiRCLE PLUS": "circle_plus",
+    "PRiSM PLUS": "prism_plus",
+    "BUDDiES": "buddies",
+}
+
+# Streamlit 会在用户切换控件后更新 session_state，再重新执行脚本。
+# 因此这里可以在生成签名之前读取当前主题。
+selected_theme_label = st.session_state.get("b50_theme_label", "原版")
+if selected_theme_label not in B50_THEMES:
+    selected_theme_label = "原版"
+
+theme_dir_name = B50_THEMES[selected_theme_label]
 png_signature = hashlib.sha256(json.dumps({
     "scores": [{k: r.get(k) for k in ("title", "difficulty", "constant", "achievement", "rating", "dx_score", "clear_type", "version", "song_id", "cover_id", "song_type", "notes", "total_notes")} for r in all_selected],
     "rating": total_rating, "mode": mode_label, "source": source,
+    "theme": theme_dir_name,
     "static_dir": str(Path(__file__).resolve().parent / "static"),
     "display_name": st.session_state.get("b50_display_name_input", "AstroDX Player"),
     "icon_id": st.session_state.get("b50_online_icon_id"),
@@ -619,16 +636,19 @@ st.markdown("<div class='section-banner purple'><span class='num'>03</span><span
 with st.container(border=True):
     st.markdown("**使用开源 B50 模板**")
     st.markdown("使用公开 B50 模板绘图；将本页匹配好的本地成绩直接转换为绘图数据，不调用水鱼账号查分流程。")
+    selected_theme_label = st.selectbox(
+        "B50 主题",
+        options=list(B50_THEMES.keys()),
+        index=list(B50_THEMES.keys()).index(
+            st.session_state.get("b50_theme_label", "原版")
+            if st.session_state.get("b50_theme_label", "原版") in B50_THEMES
+            else "原版"
+        ),
+        key="b50_theme_label",
+        help="切换 B50 海报模板主题。主题文件夹中的同名素材优先于原版素材，缺失的素材自动回退到原版。",
+    )
     static_path = str(Path(__file__).resolve().parent / "static")
     static_valid, static_result = validate_static_dir(static_path)
-    if static_valid:
-        st.success("绘图素材校验通过。")
-    else:
-        st.error("绘图素材校验失败：{}".format(static_result))
-    display_name = st.text_input(
-        "图片上显示的昵称", value=st.session_state.get("b50_display_name", "AstroDX Player"),
-        max_chars=24, key="b50_display_name_input",
-    )
 
     st.markdown("**海报外观**")
     force_asset_refresh = st.button("⟳ 刷新在线头像 / 姓名框列表", key="refresh_lxns_asset_catalogs")
@@ -801,9 +821,9 @@ with st.container(border=True):
                 unsafe_allow_html=True,
             )
 
-    if st.button("生成 B50 图片（开源模板）", key="generate_upstream_b50_png", use_container_width=True, disabled=(not all_selected or not static_valid or not asset_selection_ready)):
+    if st.button("生成 B50 图片", key="generate_upstream_b50_png", use_container_width=True, disabled=(not all_selected or not static_valid or not asset_selection_ready)):
         try:
-            with st.spinner("正在按上游 B50 模板生成图片…"):
+            with st.spinner("正在按 B50 模板生成图片…"):
                 rating_summary = (
                     "B35 (before {}): {} + B15: {} = {}".format(
                         target_version,
@@ -830,6 +850,7 @@ with st.container(border=True):
                     plate_asset_path=plate_asset_path,
                     match_level_file=selected_match_file,
                     class_level_file=selected_class_file,
+                    theme=theme_dir_name,
                 )
             st.session_state["upstream_b50_png"] = {"signature": png_signature, "bytes": png_bytes}
             st.success("已使用开源 B50 绘图代码生成图片。成绩没有上传到第三方查分器或绘图服务。")
