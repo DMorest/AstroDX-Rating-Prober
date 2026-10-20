@@ -1,0 +1,5 @@
+streamlit>=1.35,<2
+pandas>=2.0,<4
+requests>=2.31,<3
+Pillow>=10.0,<12
+aiofiles>=24.1,<25
